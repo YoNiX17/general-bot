@@ -36,6 +36,7 @@ class DataManager:
         uid = str(user_id)
         if uid not in self.data:
             self.data[uid] = {"xp": 0, "level": 1, "messages": 0, "voice_time": 0, "last_xp": 0}
+        # Migration: s'assurer que voice_time existe
         if "voice_time" not in self.data[uid]: self.data[uid]["voice_time"] = 0
         return self.data[uid]
 
@@ -53,12 +54,13 @@ class DataManager:
     def add_voice_time(self, user_id, seconds):
         user = self.get_user(user_id)
         user["voice_time"] += seconds
-        xp_gain = int((seconds / 60) * 10)
+        xp_gain = int((seconds / 60) * 10) # 10 XP par minute
         if xp_gain > 0: return self.add_xp(user_id, xp_gain)
         self.save_data()
         return False, user["level"]
 
     def get_leaderboard(self):
+        # On renvoie tout, le tri se fait ici ou coté client, ici top 50 pour l'API
         return sorted(self.data.items(), key=lambda x: x[1].get('xp', 0), reverse=True)[:50]
 
     def set_stats_channels(self, guild_id, category_id, member_id, online_id, voice_id):
@@ -84,6 +86,7 @@ class GeneralBot(commands.Bot):
         self.voice_sessions = {}
 
     async def setup_hook(self):
+        # Lancement du serveur Web (API)
         self.web_app = web.Application()
         self.web_app.router.add_get('/', self.web_home)
         self.web_app.router.add_get('/api/leaderboard', self.web_leaderboard)
@@ -110,40 +113,22 @@ class GeneralBot(commands.Bot):
         return web.Response(text=f"🤖 {self.user.name} est en ligne ! L'API est prête.")
 
     async def web_leaderboard(self, request):
-        # 1. Récupérer les données brutes (XP, Level...)
         raw_data = db.get_leaderboard()
         json_data = []
-        
-        # 2. Enrichir avec les données Discord (Avatar, Pseudo)
         for uid, data in raw_data:
-            user_id = int(uid)
-            discord_user = self.get_user(user_id) # Cherche dans le cache global du bot
-            
-            # Si pas dans le cache global, on essaie de le fetch (plus lent mais sûr)
-            if not discord_user:
-                try:
-                    discord_user = await self.fetch_user(user_id)
-                except:
-                    discord_user = None
-
-            # Valeurs par défaut si introuvable
-            name = discord_user.display_name if discord_user else "Utilisateur parti"
-            # Avatar: On prend l'avatar de guilde si possible, sinon avatar global, sinon défaut
-            if discord_user:
-                avatar = discord_user.display_avatar.url
-            else:
-                avatar = "https://cdn.discordapp.com/embed/avatars/0.png"
+            user = self.get_user(int(uid))
+            name = user.display_name if user else "Utilisateur parti"
+            avatar = user.display_avatar.url if user else "https://cdn.discordapp.com/embed/avatars/0.png"
             
             json_data.append({
                 "id": uid,
-                "name": name,   # Pseudo Discord à jour
-                "avatar": avatar, # Avatar Discord à jour
+                "name": name,
+                "avatar": avatar,
                 "level": data.get("level", 1),
                 "xp": data.get("xp", 0),
                 "messages": data.get("messages", 0),
                 "voice_time": data.get("voice_time", 0)
             })
-        
         return web.json_response(json_data, headers={"Access-Control-Allow-Origin": "*"})
 
     async def web_stats(self, request):
@@ -172,9 +157,11 @@ class GeneralBot(commands.Bot):
     async def on_voice_state_update(self, member, before, after):
         if member.bot: return
         
+        # Connexion vocal
         if before.channel is None and after.channel is not None:
             self.voice_sessions[member.id] = time.time()
         
+        # Déconnexion vocal
         elif before.channel is not None and after.channel is None:
             if member.id in self.voice_sessions:
                 duration = time.time() - self.voice_sessions.pop(member.id)
@@ -184,6 +171,7 @@ class GeneralBot(commands.Bot):
                     if chan:
                         await chan.send(f"🎙️ **Vocal Up!** {member.mention} passe niveau **{lvl}** !")
         
+        # Mise à jour des stats channels
         await self.update_server_stats(member.guild)
 
     async def on_member_join(self, member): await self.update_server_stats(member.guild)
@@ -212,6 +200,8 @@ class GeneralBot(commands.Bot):
         for guild in self.guilds: await self.update_server_stats(guild)
 
 bot = GeneralBot()
+
+# --- COMMANDES SLASH ---
 
 @bot.tree.command(name="setup_stats", description="[Admin] Crée les salons de statistiques")
 @app_commands.checks.has_permissions(administrator=True)
