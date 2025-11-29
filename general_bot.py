@@ -9,8 +9,16 @@ import random
 import asyncio
 from aiohttp import web
 from datetime import datetime
-# Import de la librairie Météo-France
-from meteofrance_api import MeteoFranceClient
+
+# --- GESTION DES DÉPENDANCES ---
+METEO_AVAILABLE = False
+try:
+    from meteofrance_api import MeteoFranceClient
+    METEO_AVAILABLE = True
+    print("✅ Module Météo-France chargé.", flush=True)
+except ImportError:
+    print("⚠️ Module 'meteofrance-api' manquant. Vérifie requirements.txt", flush=True)
+    MeteoFranceClient = None
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("GENERAL_BOT_TOKEN") 
@@ -89,6 +97,7 @@ class DataManager:
         if gid not in self.config: self.config[gid] = {}
         if "meteo_cities" not in self.config[gid]: self.config[gid]["meteo_cities"] = []
         
+        # Évite les doublons
         if city_name not in self.config[gid]["meteo_cities"]:
             self.config[gid]["meteo_cities"].append(city_name)
             self.save_config()
@@ -120,8 +129,8 @@ class GeneralBot(commands.Bot):
         intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
         self.voice_sessions = {}
-        # Client Météo France
-        self.meteo_client = MeteoFranceClient()
+        # Client Météo France initialisé SEULEMENT si le module est présent
+        self.meteo_client = MeteoFranceClient() if METEO_AVAILABLE else None
 
     async def setup_hook(self):
         # Serveur Web
@@ -135,29 +144,35 @@ class GeneralBot(commands.Bot):
         port = int(os.getenv("PORT", 8080))
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        print(f"🌐 API Web lancée sur le port {port}")
+        print(f"🌐 API Web lancée sur le port {port}", flush=True)
 
     async def on_ready(self):
-        print(f'🤖 Bot Général connecté : {self.user}')
+        print(f'🤖 Bot Général connecté : {self.user}', flush=True)
         try:
             # Force la synchronisation sur tous les serveurs pour que les commandes apparaissent tout de suite
             for guild in self.guilds:
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
-                print(f"✅ Commandes synchronisées pour : {guild.name}")
-            print("🔄 Synchronisation terminée.")
+                print(f"✅ Commandes synchronisées pour : {guild.name}", flush=True)
+            print("🔄 Synchronisation terminée.", flush=True)
         except Exception as e:
-            print(f"Erreur synchro au démarrage : {e}")
+            print(f"Erreur synchro au démarrage : {e}", flush=True)
         
         # Lancement des boucles
         if not self.update_stats_loop.is_running():
             self.update_stats_loop.start()
-        if not self.meteo_loop.is_running():
+        
+        # On lance la boucle météo seulement si le client est dispo
+        if self.meteo_client and not self.meteo_loop.is_running():
             self.meteo_loop.start()
+        elif not self.meteo_client:
+            print("⚠️ Boucle météo non démarrée (Module manquant).", flush=True)
 
     # --- FONCTIONS METEO ---
     async def fetch_weather(self, city_name):
         """Récupère la météo de manière asynchrone pour ne pas bloquer le bot"""
+        if not self.meteo_client: return None
+
         def get_data():
             try:
                 places = self.meteo_client.search_places(city_name)
@@ -172,14 +187,94 @@ class GeneralBot(commands.Bot):
                     next_rain = None
                 return place, forecast, next_rain
             except Exception as e:
-                print(f"Erreur météo {city_name}: {e}")
+                print(f"Erreur météo {city_name}: {e}", flush=True)
                 return None
 
         return await asyncio.to_thread(get_data)
 
+    def create_weather_embed(self, place, forecast, next_rain):
+        """Génère un joli Embed pour l'affichage météo"""
+        current = forecast.current_forecast
+        temp = current['T']['value']
+        desc = current['weather']['desc']
+        
+        # --- LOGIQUE ICONES ---
+        def get_weather_icon(description):
+            d = description.lower()
+            if "neige" in d: return "❄️"
+            if "orage" in d: return "⛈️"
+            if "pluie" in d or "averse" in d: return "🌧️"
+            if "couvert" in d or "brume" in d: return "☁️"
+            if "nuage" in d or "éclaircies" in d: return "⛅" # Un soleil nuage
+            if "ensoleillé" in d or "clair" in d: return "☀️"
+            return "🌍" # Défaut
+
+        icon = get_weather_icon(desc)
+        
+        # Choix de la couleur
+        if icon == "☀️": color = 0xFFA500
+        elif icon == "⛅": color = 0xF1C40F
+        elif icon == "☁️": color = 0x95A5A6
+        elif icon == "🌧️": color = 0x3498DB
+        elif icon == "❄️": color = 0xFFFFFF
+        elif icon == "⛈️": color = 0x8E44AD
+        else: color = 0x2ECC71
+
+        embed = discord.Embed(title=f"{icon} Météo à {place.name}", description=f"📍 **{place.admin2}** ({place.country})", color=color)
+        
+        # Section Aujourd'hui
+        embed.add_field(name="🌡️ Actuellement", value=f"**{temp}°C**\n*{desc}*", inline=True)
+        
+        if next_rain:
+            embed.add_field(name="☔ Risque Pluie", value=f"⚠️ Arrive à **{next_rain.strftime('%H:%M')}**", inline=True)
+        else:
+            embed.add_field(name="☔ Risque Pluie", value="Rien dans l'heure", inline=True)
+
+        # --- PREVISIONS HEURE PAR HEURE (24H) ---
+        # On récupère les données brutes des prévisions horaires
+        hourly_data = forecast.forecast
+        
+        next_12h = ""
+        following_12h = ""
+        
+        count = 0
+        now = time.time()
+        
+        for f in hourly_data:
+            f_time = f['dt']
+            # On ignore les heures passées
+            if f_time < now: continue
+            
+            # On s'arrête après 24 entrées
+            if count >= 24: break
+            
+            # Formatage : 14h ☀️ 20°C
+            local_time = datetime.fromtimestamp(f_time).strftime('%Hh')
+            f_icon = get_weather_icon(f['weather']['desc'])
+            f_temp = f['T']['value']
+            
+            line = f"`{local_time}` {f_icon} **{f_temp}°C**\n"
+            
+            if count < 12:
+                next_12h += line
+            else:
+                following_12h += line
+            
+            count += 1
+            
+        if next_12h:
+            embed.add_field(name="🕐 Prochaines 12h", value=next_12h, inline=True)
+        if following_12h:
+            embed.add_field(name="🕐 Suite (12h-24h)", value=following_12h, inline=True)
+
+        # Pied de page
+        embed.set_footer(text=f"Données Météo-France • Actualisé à {datetime.now().strftime('%H:%M')}")
+        return embed
+
     # --- ROUTES API WEB ---
     async def web_home(self, request):
-        return web.Response(text=f"🤖 {self.user.name} est en ligne ! L'API est prête.")
+        status_meteo = "ACTIF" if METEO_AVAILABLE else "INACTIF (Erreur module)"
+        return web.Response(text=f"🤖 {self.user.name} est en ligne ! Météo: {status_meteo}")
 
     async def web_leaderboard(self, request):
         raw_data = db.get_leaderboard()
@@ -261,7 +356,7 @@ class GeneralBot(commands.Bot):
     # --- BOUCLE METEO (Chaque Heure) ---
     @tasks.loop(minutes=60)
     async def meteo_loop(self):
-        print("🌦️ Mise à jour météo...")
+        print("🌦️ Mise à jour météo...", flush=True)
         for guild in self.guilds:
             config = db.get_meteo_config(guild.id)
             channel_id = config.get("meteo_channel")
@@ -282,48 +377,22 @@ class GeneralBot(commands.Bot):
                 if not data: continue
                 
                 place, forecast, next_rain = data
-                
-                # Données actuelles
-                current = forecast.current_forecast
-                temp = current['T']['value']
-                desc = current['weather']['desc']
-                icon = "☀️" if "ensoleillé" in desc.lower() else "☁️" if "nuage" in desc.lower() else "🌧️"
-                
-                # Données Demain
-                tomorrow = forecast.daily_forecast[1] # [0] = aujourd'hui, [1] = demain
-                t_min = tomorrow['T']['min']
-                t_max = tomorrow['T']['max']
-                t_desc = tomorrow['weather12H']['desc']
-
-                # Construction Embed
-                embed = discord.Embed(title=f"{icon} Météo : {place.name} ({place.admin2})", color=discord.Color.blue())
-                embed.add_field(name="🌡️ Actuellement", value=f"**{temp}°C**\n{desc}", inline=True)
-                
-                if next_rain:
-                    embed.add_field(name="☔ Pluie", value=f"Prévue à {next_rain.strftime('%H:%M')}", inline=True)
-                else:
-                    embed.add_field(name="☔ Pluie", value="Pas de pluie dans l'heure", inline=True)
-
-                embed.add_field(name="📅 Demain", value=f"Min: {t_min}°C | Max: {t_max}°C\n*{t_desc}*", inline=False)
-                embed.set_footer(text=f"Mise à jour : {datetime.now().strftime('%H:%M')}")
-                
+                embed = self.create_weather_embed(place, forecast, next_rain)
                 await channel.send(embed=embed)
                 await asyncio.sleep(2) # Pause pour éviter le rate-limit
 
 bot = GeneralBot()
 
-# --- COMMANDE DE FORCE-SYNC (Pour faire apparaitre les commandes) ---
+# --- COMMANDE DE FORCE-SYNC ---
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def sync(ctx):
-    """Force la synchronisation des commandes slash pour CE serveur"""
+    """Force la synchronisation des commandes slash"""
     msg = await ctx.send("🔄 Synchronisation des commandes en cours...")
     try:
-        # Copie les commandes globales vers ce serveur
         bot.tree.copy_global_to(guild=ctx.guild)
-        # Synchronise
         synced = await bot.tree.sync(guild=ctx.guild)
-        await msg.edit(content=f"✅ **{len(synced)}** commandes synchronisées ! Elles sont disponibles immédiatement.")
+        await msg.edit(content=f"✅ **{len(synced)}** commandes synchronisées !")
     except Exception as e:
         await msg.edit(content=f"❌ Erreur de synchro : {e}")
 
@@ -336,39 +405,67 @@ async def sync(ctx):
 @bot.tree.command(name="meteo_setup", description="[Admin] Définit le salon météo")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_setup(interaction: discord.Interaction, salon: discord.TextChannel):
+    if not METEO_AVAILABLE:
+        return await interaction.response.send_message("❌ Module Météo non disponible.", ephemeral=True)
     db.set_meteo_channel(interaction.guild.id, salon.id)
     await interaction.response.send_message(f"✅ Le salon météo est défini sur {salon.mention}. Ajoute des villes avec `/meteo_add`.", ephemeral=True)
 
-@bot.tree.command(name="meteo_add", description="Ajoute une ville à suivre")
+@bot.tree.command(name="meteo_add", description="Ajoute une ville et affiche sa météo")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_add(interaction: discord.Interaction, ville: str):
+    if not METEO_AVAILABLE:
+        return await interaction.response.send_message("❌ Module Météo non disponible.", ephemeral=True)
+    
     await interaction.response.defer()
-    # Vérif si la ville existe
+    
+    # 1. Vérif si la ville existe
     data = await bot.fetch_weather(ville)
     if not data:
         await interaction.followup.send(f"❌ Ville '{ville}' introuvable sur Météo-France.")
         return
     
-    place = data[0]
-    if db.add_meteo_city(interaction.guild.id, place.name):
-        await interaction.followup.send(f"✅ **{place.name}** ({place.admin2}) ajoutée aux prévisions !")
+    place, forecast, next_rain = data
+    
+    # 2. Ajout en base de données
+    added = db.add_meteo_city(interaction.guild.id, place.name)
+    
+    # 3. Création de l'interface graphique (Embed)
+    embed = bot.create_weather_embed(place, forecast, next_rain)
+    
+    if added:
+        await interaction.followup.send(f"✅ **{place.name}** ajoutée aux prévisions quotidiennes !", embed=embed)
     else:
-        await interaction.followup.send(f"⚠️ **{place.name}** est déjà dans la liste.")
+        await interaction.followup.send(f"⚠️ **{place.name}** est déjà dans la liste, mais voici la météo :", embed=embed)
 
-@bot.tree.command(name="meteo_remove", description="Retire une ville")
+@bot.tree.command(name="meteo_remove", description="Retire une ville des prévisions")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_remove(interaction: discord.Interaction, ville: str):
     if db.remove_meteo_city(interaction.guild.id, ville):
-        await interaction.response.send_message(f"🗑️ **{ville}** retirée des prévisions.")
+        await interaction.response.send_message(f"🗑️ **{ville}** a été retirée des prévisions automatiques.")
     else:
-        await interaction.response.send_message(f"❌ Cette ville n'était pas suivie.", ephemeral=True)
+        await interaction.response.send_message(f"❌ La ville **{ville}** n'était pas dans la liste.", ephemeral=True)
+
+@bot.tree.command(name="meteo_list", description="Affiche la liste des villes suivies")
+@app_commands.checks.has_permissions(administrator=True)
+async def meteo_list(interaction: discord.Interaction):
+    config = db.get_meteo_config(interaction.guild.id)
+    cities = config.get("meteo_cities", [])
+    
+    if not cities:
+        await interaction.response.send_message("📭 Aucune ville n'est suivie pour le moment.", ephemeral=True)
+    else:
+        liste = "\n".join([f"• {c}" for c in cities])
+        embed = discord.Embed(title="🌍 Villes suivies", description=liste, color=discord.Color.blue())
+        await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="meteo_now", description="Force la mise à jour météo immédiate")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_now(interaction: discord.Interaction):
+    if not METEO_AVAILABLE:
+        return await interaction.response.send_message("❌ Module Météo non disponible.", ephemeral=True)
+    
     await interaction.response.send_message("🔄 Mise à jour forcée en cours...", ephemeral=True)
-    # On force l'exécution de la boucle (hack pour lancer la tache sans attendre l'heure)
-    # Note : Cela ne reset pas le timer de la loop, c'est juste une exécution one-shot
+    
     config = db.get_meteo_config(interaction.guild.id)
     channel_id = config.get("meteo_channel")
     if not channel_id: return
@@ -384,14 +481,7 @@ async def meteo_now(interaction: discord.Interaction):
             data = await bot.fetch_weather(city)
             if data:
                 place, forecast, next_rain = data
-                current = forecast.current_forecast
-                temp = current['T']['value']
-                desc = current['weather']['desc']
-                tomorrow = forecast.daily_forecast[1]
-                
-                embed = discord.Embed(title=f"Météo : {place.name}", color=discord.Color.blue())
-                embed.add_field(name="Actuellement", value=f"{temp}°C - {desc}")
-                embed.add_field(name="Demain", value=f"{tomorrow['T']['min']}/{tomorrow['T']['max']}°C - {tomorrow['weather12H']['desc']}")
+                embed = bot.create_weather_embed(place, forecast, next_rain)
                 await channel.send(embed=embed)
 
 # ... (Reste de tes commandes existantes) ...
@@ -472,5 +562,8 @@ async def serverinfo(interaction: discord.Interaction):
     embed.add_field(name="Salons", value=str(len(guild.channels)))
     await interaction.response.send_message(embed=embed)
 
-if not TOKEN: print("❌ Variable GENERAL_BOT_TOKEN manquante")
-else: bot.run(TOKEN)
+if not TOKEN:
+    print("❌ Variable GENERAL_BOT_TOKEN manquante", flush=True)
+else:
+    print("🚀 Lancement du bot...", flush=True)
+    bot.run(TOKEN)
