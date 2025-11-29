@@ -1,3 +1,5 @@
+print("⏳ Chargement des modules... (Si ça bloque ici, vérifie ta version de Python)", flush=True)
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -10,13 +12,20 @@ import asyncio
 from aiohttp import web
 from datetime import datetime
 # Import de la librairie Météo-France
-from meteofrance_api import MeteoFranceClient
+try:
+    from meteofrance_api import MeteoFranceClient
+    print("✅ Module Météo-France chargé.", flush=True)
+except ImportError as e:
+    print(f"❌ Erreur critique : Impossible d'importer meteofrance_api. {e}", flush=True)
+    exit(1)
 
 # --- CONFIGURATION ---
+print("⚙️ Chargement de la configuration...", flush=True)
 TOKEN = os.getenv("GENERAL_BOT_TOKEN") 
 DATA_FILE = "general_data.json"
 CONFIG_FILE = "server_config.json"
 
+# Configuration des logs pour voir les erreurs Discord
 logging.basicConfig(level=logging.INFO)
 
 # --- GESTION DES DONNÉES ---
@@ -120,7 +129,6 @@ class GeneralBot(commands.Bot):
         intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
         self.voice_sessions = {}
-        # Client Météo France
         self.meteo_client = MeteoFranceClient()
 
     async def setup_hook(self):
@@ -135,17 +143,23 @@ class GeneralBot(commands.Bot):
         port = int(os.getenv("PORT", 8080))
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        print(f"🌐 API Web lancée sur le port {port}")
+        print(f"🌐 API Web lancée sur le port {port}", flush=True)
 
     async def on_ready(self):
-        print(f'🤖 Bot Général connecté : {self.user}')
+        print(f'🤖 Bot connecté en tant que : {self.user} (ID: {self.user.id})', flush=True)
+        print("🔄 Début de la synchronisation des commandes...", flush=True)
+        
         try:
-            # Sync global (peut être lent)
-            # synced = await self.tree.sync()
-            # print(f"🔄 {len(synced)} commandes synchronisées globalement.")
-            pass # On laisse la commande !sync gérer ça manuellement pour éviter les rate-limits
+            # Force la synchronisation sur tous les serveurs
+            for guild in self.guilds:
+                print(f"   - Synchro pour {guild.name} ({guild.id})...", end="", flush=True)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                print(" OK", flush=True)
+            print("✅ Synchronisation terminée ! Les commandes devraient apparaître.", flush=True)
         except Exception as e:
-            print(f"Erreur synchro au démarrage : {e}")
+            print(f"\n❌ Erreur pendant la synchro : {e}", flush=True)
+            print("💡 Conseil : Si ça échoue, utilise la commande '!sync' dans le chat.", flush=True)
         
         # Lancement des boucles
         if not self.update_stats_loop.is_running():
@@ -155,14 +169,12 @@ class GeneralBot(commands.Bot):
 
     # --- FONCTIONS METEO ---
     async def fetch_weather(self, city_name):
-        """Récupère la météo de manière asynchrone pour ne pas bloquer le bot"""
         def get_data():
             try:
                 places = self.meteo_client.search_places(city_name)
                 if not places: return None
                 place = places[0]
                 forecast = self.meteo_client.get_forecast_for_place(place)
-                # Tentative récupération pluie (peut échouer selon le lieu)
                 try:
                     rain = self.meteo_client.get_rain(place.latitude, place.longitude)
                     next_rain = rain.next_rain_date_locale()
@@ -172,7 +184,6 @@ class GeneralBot(commands.Bot):
             except Exception as e:
                 print(f"Erreur météo {city_name}: {e}")
                 return None
-
         return await asyncio.to_thread(get_data)
 
     # --- ROUTES API WEB ---
@@ -202,12 +213,10 @@ class GeneralBot(commands.Bot):
             "online": total_online, "voice_count": total_voice
         }, headers={"Access-Control-Allow-Origin": "*"})
 
-    # --- EVENTS BOT (XP, VOCAL) ---
+    # --- EVENTS BOT ---
     async def on_message(self, message):
         if message.author.bot or not message.guild: return
-        
-        # On doit traiter les commandes textuelles (comme !sync) avant le reste
-        await self.process_commands(message)
+        await self.process_commands(message) # Important pour !sync
 
         user = db.get_user(message.author.id)
         if time.time() - user.get("last_xp", 0) > 10:
@@ -256,10 +265,10 @@ class GeneralBot(commands.Bot):
     async def update_stats_loop(self):
         for guild in self.guilds: await self.update_server_stats(guild)
 
-    # --- BOUCLE METEO (Chaque Heure) ---
+    # --- BOUCLE METEO ---
     @tasks.loop(minutes=60)
     async def meteo_loop(self):
-        print("🌦️ Mise à jour météo...")
+        print("🌦️ Boucle Météo : Vérification...", flush=True)
         for guild in self.guilds:
             config = db.get_meteo_config(guild.id)
             channel_id = config.get("meteo_channel")
@@ -270,7 +279,6 @@ class GeneralBot(commands.Bot):
             channel = guild.get_channel(channel_id)
             if not channel: continue
 
-            # On nettoie les anciens messages du bot (optionnel, pour garder le salon propre)
             try:
                 deleted = await channel.purge(limit=10, check=lambda m: m.author == self.user)
             except: pass
@@ -278,197 +286,131 @@ class GeneralBot(commands.Bot):
             for city in cities:
                 data = await self.fetch_weather(city)
                 if not data: continue
-                
                 place, forecast, next_rain = data
-                
-                # Données actuelles
                 current = forecast.current_forecast
                 temp = current['T']['value']
                 desc = current['weather']['desc']
                 icon = "☀️" if "ensoleillé" in desc.lower() else "☁️" if "nuage" in desc.lower() else "🌧️"
-                
-                # Données Demain
-                tomorrow = forecast.daily_forecast[1] # [0] = aujourd'hui, [1] = demain
+                tomorrow = forecast.daily_forecast[1]
                 t_min = tomorrow['T']['min']
                 t_max = tomorrow['T']['max']
                 t_desc = tomorrow['weather12H']['desc']
 
-                # Construction Embed
                 embed = discord.Embed(title=f"{icon} Météo : {place.name} ({place.admin2})", color=discord.Color.blue())
                 embed.add_field(name="🌡️ Actuellement", value=f"**{temp}°C**\n{desc}", inline=True)
-                
-                if next_rain:
-                    embed.add_field(name="☔ Pluie", value=f"Prévue à {next_rain.strftime('%H:%M')}", inline=True)
-                else:
-                    embed.add_field(name="☔ Pluie", value="Pas de pluie dans l'heure", inline=True)
-
+                if next_rain: embed.add_field(name="☔ Pluie", value=f"Prévue à {next_rain.strftime('%H:%M')}", inline=True)
+                else: embed.add_field(name="☔ Pluie", value="Pas de pluie dans l'heure", inline=True)
                 embed.add_field(name="📅 Demain", value=f"Min: {t_min}°C | Max: {t_max}°C\n*{t_desc}*", inline=False)
                 embed.set_footer(text=f"Mise à jour : {datetime.now().strftime('%H:%M')}")
                 
                 await channel.send(embed=embed)
-                await asyncio.sleep(2) # Pause pour éviter le rate-limit
+                await asyncio.sleep(2)
 
 bot = GeneralBot()
 
-# --- COMMANDE DE FORCE-SYNC (Pour faire apparaitre les commandes) ---
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def sync(ctx):
-    """Force la synchronisation des commandes slash pour CE serveur"""
-    msg = await ctx.send("🔄 Synchronisation des commandes en cours...")
+    msg = await ctx.send("🔄 Force-Sync...")
     try:
-        # Copie les commandes globales vers ce serveur
         bot.tree.copy_global_to(guild=ctx.guild)
-        # Synchronise
         synced = await bot.tree.sync(guild=ctx.guild)
-        await msg.edit(content=f"✅ **{len(synced)}** commandes synchronisées ! Elles sont disponibles immédiatement.")
+        await msg.edit(content=f"✅ {len(synced)} commandes synchronisées sur ce serveur.")
     except Exception as e:
-        await msg.edit(content=f"❌ Erreur de synchro : {e}")
+        await msg.edit(content=f"❌ Erreur : {e}")
 
-# --- COMMANDES SLASH ---
-
-# ... (Tes commandes précédentes setups_stats, rank, leaderboard, clear, serverinfo restent ici) ...
-
-# --- NOUVELLES COMMANDES METEO ---
-
-@bot.tree.command(name="meteo_setup", description="[Admin] Définit le salon météo")
+# --- COMMANDES SLASH METEO ---
+@bot.tree.command(name="meteo_setup", description="Définit le salon météo")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_setup(interaction: discord.Interaction, salon: discord.TextChannel):
     db.set_meteo_channel(interaction.guild.id, salon.id)
-    await interaction.response.send_message(f"✅ Le salon météo est défini sur {salon.mention}. Ajoute des villes avec `/meteo_add`.", ephemeral=True)
+    await interaction.response.send_message(f"✅ Salon météo défini sur {salon.mention}.", ephemeral=True)
 
-@bot.tree.command(name="meteo_add", description="Ajoute une ville à suivre")
+@bot.tree.command(name="meteo_add", description="Ajoute une ville")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_add(interaction: discord.Interaction, ville: str):
     await interaction.response.defer()
-    # Vérif si la ville existe
     data = await bot.fetch_weather(ville)
     if not data:
-        await interaction.followup.send(f"❌ Ville '{ville}' introuvable sur Météo-France.")
+        await interaction.followup.send(f"❌ Ville '{ville}' introuvable.")
         return
-    
     place = data[0]
     if db.add_meteo_city(interaction.guild.id, place.name):
-        await interaction.followup.send(f"✅ **{place.name}** ({place.admin2}) ajoutée aux prévisions !")
+        await interaction.followup.send(f"✅ **{place.name}** ajoutée !")
     else:
-        await interaction.followup.send(f"⚠️ **{place.name}** est déjà dans la liste.")
+        await interaction.followup.send(f"⚠️ **{place.name}** est déjà suivie.")
 
 @bot.tree.command(name="meteo_remove", description="Retire une ville")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_remove(interaction: discord.Interaction, ville: str):
     if db.remove_meteo_city(interaction.guild.id, ville):
-        await interaction.response.send_message(f"🗑️ **{ville}** retirée des prévisions.")
+        await interaction.response.send_message(f"🗑️ **{ville}** retirée.")
     else:
-        await interaction.response.send_message(f"❌ Cette ville n'était pas suivie.", ephemeral=True)
+        await interaction.response.send_message(f"❌ Ville non trouvée.", ephemeral=True)
 
-@bot.tree.command(name="meteo_now", description="Force la mise à jour météo immédiate")
+@bot.tree.command(name="meteo_now", description="Mise à jour météo immédiate")
 @app_commands.checks.has_permissions(administrator=True)
 async def meteo_now(interaction: discord.Interaction):
-    await interaction.response.send_message("🔄 Mise à jour forcée en cours...", ephemeral=True)
-    # On force l'exécution de la boucle (hack pour lancer la tache sans attendre l'heure)
-    # Note : Cela ne reset pas le timer de la loop, c'est juste une exécution one-shot
+    await interaction.response.send_message("🔄 Mise à jour en cours...", ephemeral=True)
     config = db.get_meteo_config(interaction.guild.id)
     channel_id = config.get("meteo_channel")
-    if not channel_id: return
-    
     channel = interaction.guild.get_channel(channel_id)
     cities = config.get("meteo_cities", [])
-    
     if channel and cities:
-        try: await channel.purge(limit=10, check=lambda m: m.author == bot.user)
-        except: pass
-        
         for city in cities:
             data = await bot.fetch_weather(city)
             if data:
                 place, forecast, next_rain = data
                 current = forecast.current_forecast
-                temp = current['T']['value']
-                desc = current['weather']['desc']
-                tomorrow = forecast.daily_forecast[1]
-                
                 embed = discord.Embed(title=f"Météo : {place.name}", color=discord.Color.blue())
-                embed.add_field(name="Actuellement", value=f"{temp}°C - {desc}")
-                embed.add_field(name="Demain", value=f"{tomorrow['T']['min']}/{tomorrow['T']['max']}°C - {tomorrow['weather12H']['desc']}")
+                embed.add_field(name="Actuellement", value=f"{current['T']['value']}°C - {current['weather']['desc']}")
                 await channel.send(embed=embed)
 
-# ... (Reste de tes commandes existantes) ...
-@bot.tree.command(name="setup_stats", description="[Admin] Crée les salons de statistiques")
+# AUTRES COMMANDES (Rank, etc.)
+@bot.tree.command(name="setup_stats", description="Crée les salons de statistiques")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_stats(interaction: discord.Interaction):
     await interaction.response.defer()
     guild = interaction.guild
     overwrites = {guild.default_role: discord.PermissionOverwrite(connect=False)}
-    
     cat = await guild.create_category("📊 STATISTIQUES")
     c1 = await guild.create_voice_channel(f"👥 Membres : {guild.member_count}", category=cat, overwrites=overwrites)
     online = sum(1 for m in guild.members if m.status != discord.Status.offline)
     c2 = await guild.create_voice_channel(f"🟢 En ligne : {online}", category=cat, overwrites=overwrites)
     voice = sum(len(vc.members) for vc in guild.voice_channels)
     c3 = await guild.create_voice_channel(f"🔊 En vocal : {voice}", category=cat, overwrites=overwrites)
-    
     db.set_stats_channels(guild.id, cat.id, c1.id, c2.id, c3.id)
-    await interaction.followup.send("✅ **Système de stats installé !**")
+    await interaction.followup.send("✅ Stats installées !")
 
-@bot.tree.command(name="rank", description="Affiche ton niveau et XP")
+@bot.tree.command(name="rank", description="Affiche le niveau")
 async def rank(interaction: discord.Interaction, membre: discord.Member = None):
     target = membre or interaction.user
     data = db.get_user(target.id)
-    all_users = sorted(db.data.items(), key=lambda x: x[1]['xp'], reverse=True)
-    try: rank_pos = [uid for uid, _ in all_users].index(str(target.id)) + 1
-    except: rank_pos = "N/A"
-    
-    embed = discord.Embed(color=target.color)
-    embed.set_author(name=f"Progression de {target.display_name}", icon_url=target.display_avatar.url)
-    embed.add_field(name="🏆 Rang", value=f"#{rank_pos}", inline=True)
-    embed.add_field(name="⭐ Niveau", value=f"{data['level']}", inline=True)
-    embed.add_field(name="✨ XP Total", value=f"{data['xp']}", inline=True)
-    
-    next_xp = 5 * (data["level"] ** 2) + 50 * data["level"] + 100
-    percent = min(1.0, data["xp"] / next_xp)
-    bars = int(percent * 10)
-    progress = "🟩" * bars + "⬛" * (10 - bars)
-    
-    embed.add_field(name="Prochain niveau", value=f"{progress} {int(percent*100)}%", inline=False)
-    
-    voice_h = int(data['voice_time'] // 3600)
-    voice_m = int((data['voice_time'] % 3600) // 60)
-    embed.set_footer(text=f"✉️ Messages: {data['messages']} • 🎙️ Vocal: {voice_h}h {voice_m}m")
-    
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(f"👤 **{target.display_name}** est niveau {data['level']} ({data['xp']} XP).")
 
-@bot.tree.command(name="leaderboard", description="Affiche le TOP 10 du serveur")
+@bot.tree.command(name="leaderboard", description="TOP 10")
 async def leaderboard(interaction: discord.Interaction):
-    top_users = db.get_leaderboard() 
-    if not top_users: return await interaction.response.send_message("❌ Pas assez de données.", ephemeral=True)
-    
-    desc = ""
-    for i, (uid, data) in enumerate(top_users[:10]):
-        user = interaction.guild.get_member(int(uid))
-        name = user.display_name if user else "Utilisateur parti"
-        medals = ["🥇", "🥈", "🥉"]
-        rank_emoji = medals[i] if i < 3 else f"`{i+1}.`"
-        desc += f"{rank_emoji} **{name}** • Lvl {data['level']} (*{data['xp']} XP*)\n"
-    
-    embed = discord.Embed(title="🏆 Classement du Serveur", description=desc, color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed)
+    top = db.get_leaderboard()[:10]
+    desc = "\n".join([f"{i+1}. <@{uid}> - Lvl {d['level']}" for i, (uid, d) in enumerate(top)])
+    await interaction.response.send_message(embed=discord.Embed(title="Classement", description=desc or "Vide"))
+
+@bot.tree.command(name="serverinfo", description="Infos serveur")
+async def serverinfo(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Serveur : {interaction.guild.name} | Membres : {interaction.guild.member_count}")
 
 @bot.tree.command(name="clear", description="Supprime des messages")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def clear(interaction: discord.Interaction, nombre: int):
     await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=nombre)
-    await interaction.followup.send(f"🧹 **{len(deleted)}** messages nettoyés.", ephemeral=True)
+    d = await interaction.channel.purge(limit=nombre)
+    await interaction.followup.send(f"🧹 {len(d)} messages supprimés.", ephemeral=True)
 
-@bot.tree.command(name="serverinfo", description="Infos du serveur")
-async def serverinfo(interaction: discord.Interaction):
-    guild = interaction.guild
-    embed = discord.Embed(title=f"Infos {guild.name}", color=discord.Color.blue())
-    if guild.icon: embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Membres", value=str(guild.member_count))
-    embed.add_field(name="En ligne", value=str(sum(1 for m in guild.members if m.status != discord.Status.offline)))
-    embed.add_field(name="Salons", value=str(len(guild.channels)))
-    await interaction.response.send_message(embed=embed)
-
-if not TOKEN: print("❌ Variable GENERAL_BOT_TOKEN manquante")
-else: bot.run(TOKEN)
+# Lancement
+if not TOKEN:
+    print("❌ ERREUR CRITIQUE : La variable GENERAL_BOT_TOKEN n'existe pas.", flush=True)
+else:
+    print("🚀 Tentative de connexion au bot...", flush=True)
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"🔥 ERREUR AU LANCEMENT : {e}", flush=True)
