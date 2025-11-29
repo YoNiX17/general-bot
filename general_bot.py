@@ -140,10 +140,12 @@ class GeneralBot(commands.Bot):
     async def on_ready(self):
         print(f'🤖 Bot Général connecté : {self.user}')
         try:
-            await self.tree.sync()
-            print("🔄 Commandes synchronisées.")
+            # Sync global (peut être lent)
+            # synced = await self.tree.sync()
+            # print(f"🔄 {len(synced)} commandes synchronisées globalement.")
+            pass # On laisse la commande !sync gérer ça manuellement pour éviter les rate-limits
         except Exception as e:
-            print(f"Erreur synchro : {e}")
+            print(f"Erreur synchro au démarrage : {e}")
         
         # Lancement des boucles
         if not self.update_stats_loop.is_running():
@@ -203,6 +205,10 @@ class GeneralBot(commands.Bot):
     # --- EVENTS BOT (XP, VOCAL) ---
     async def on_message(self, message):
         if message.author.bot or not message.guild: return
+        
+        # On doit traiter les commandes textuelles (comme !sync) avant le reste
+        await self.process_commands(message)
+
         user = db.get_user(message.author.id)
         if time.time() - user.get("last_xp", 0) > 10:
             user["messages"] += 1
@@ -303,6 +309,21 @@ class GeneralBot(commands.Bot):
                 await asyncio.sleep(2) # Pause pour éviter le rate-limit
 
 bot = GeneralBot()
+
+# --- COMMANDE DE FORCE-SYNC (Pour faire apparaitre les commandes) ---
+@bot.command(name="sync")
+@commands.has_permissions(administrator=True)
+async def sync(ctx):
+    """Force la synchronisation des commandes slash pour CE serveur"""
+    msg = await ctx.send("🔄 Synchronisation des commandes en cours...")
+    try:
+        # Copie les commandes globales vers ce serveur
+        bot.tree.copy_global_to(guild=ctx.guild)
+        # Synchronise
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await msg.edit(content=f"✅ **{len(synced)}** commandes synchronisées ! Elles sont disponibles immédiatement.")
+    except Exception as e:
+        await msg.edit(content=f"❌ Erreur de synchro : {e}")
 
 # --- COMMANDES SLASH ---
 
